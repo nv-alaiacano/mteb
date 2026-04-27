@@ -28,6 +28,7 @@ from mteb.results import BenchmarkResults, ModelResult, TaskResult
 if TYPE_CHECKING:
     from collections.abc import Iterable, Sequence
 
+    from mteb.results.parquet_query import ParquetResultsQuery
     from mteb.types import ModelName, Revision
 
 logger = logging.getLogger(__name__)
@@ -526,6 +527,33 @@ class ResultCache:
             msg = f"Cache directory `{self.cache_path}` does not exist."
             logger.warning(msg)
             warnings.warn(msg)
+
+    def parquet_query(
+        self,
+        parquet_filename: str = "__cached_results.parquet",
+    ) -> ParquetResultsQuery:
+        """Return a DuckDB-backed query interface over the cached parquet.
+
+        Args:
+            parquet_filename: Name of the parquet file under
+                ``{cache_path}/leaderboard/``. Defaults to
+                ``__cached_results.parquet``.
+
+        Returns:
+            A :class:`mteb.results.ParquetResultsQuery` bound to the
+            cached parquet file. The DuckDB connection is opened lazily
+            on first use, so importing this method does not require
+            ``duckdb`` to be installed.
+
+        Raises:
+            FileNotFoundError: If the parquet file has not been
+                downloaded or rebuilt yet. Call ``_load_from_cache``
+                first to populate the cache.
+        """
+        from mteb.results import ParquetResultsQuery
+
+        parquet_path = self.cache_path / "leaderboard" / parquet_filename
+        return ParquetResultsQuery(parquet_path)
 
     def _load_from_cache(
         self,

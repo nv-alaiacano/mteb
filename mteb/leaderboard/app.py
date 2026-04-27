@@ -24,8 +24,8 @@ from mteb.leaderboard.benchmark_selector import (
     DEFAULT_BENCHMARK_NAME,
     _make_selector,
 )
-from mteb.leaderboard.cached_benchmark_results import CachedBenchmarkResults
 from mteb.leaderboard.event_logger import EventLogger
+from mteb.leaderboard.parquet_benchmark_results import ParquetBenchmarkResults
 from mteb.leaderboard.figures import (
     _performance_over_time_plot,
     _performance_size_plot,
@@ -428,11 +428,16 @@ def get_leaderboard_app(  # noqa: PLR0914
     app_start = time.time()
     logger.info("=== Starting leaderboard app initialization ===")
 
-    logger.info("Step 1/7: Loading all benchmark results...")
+    logger.info("Step 1/7: Opening DuckDB query handle over the parquet cache...")
     load_start = time.time()
-    all_results = cache._load_from_cache(rebuild=rebuild)
+    if rebuild:
+        # Rebuild still goes through the legacy path so the parquet
+        # gets refreshed before we open it. Throw the result away --
+        # the leaderboard reads from the parquet from now on.
+        cache._load_from_cache(rebuild=True)
+    parquet_query = cache.parquet_query()
     load_time = time.time() - load_start
-    logger.info(f"Step 1/7 complete: Loaded results in {load_time:.2f}s")
+    logger.info(f"Step 1/7 complete: Opened DuckDB handle in {load_time:.2f}s")
 
     logger.info("Step 2/7: Fetching benchmarks...")
     bench_start = time.time()
@@ -445,15 +450,21 @@ def get_leaderboard_app(  # noqa: PLR0914
     )
 
     logger.info(
-        "Step 3/7: Processing all benchmarks (select_tasks + join_revisions)..."
+        "Step 3/7: Building per-benchmark ParquetBenchmarkResults "
+        "(filter spec only; no SQL runs yet)..."
     )
     process_start = time.time()
+    # Each entry is a lightweight filter spec over the shared parquet
+    # query. select_tasks + join_revisions push the keep-set into a
+    # DuckDB temp table on the next read; nothing materializes until a
+    # callback actually pulls a DataFrame.
     all_benchmark_results = {
-        benchmark.name: CachedBenchmarkResults.model_construct(
-            model_results=all_results.select_tasks(benchmark.tasks)
-            .join_revisions()
-            .model_results
+        benchmark.name: ParquetBenchmarkResults(
+            parquet_query=parquet_query,
+            benchmark=benchmark,
         )
+        .select_tasks(benchmark.tasks)
+        .join_revisions()
         for benchmark in benchmarks
     }
     process_time = time.time() - process_start

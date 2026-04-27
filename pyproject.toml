@@ -75,6 +75,7 @@ leaderboard = [
     "cachetools>=5.2.0",
     "matplotlib>=3.9.4",
     "pymongo>=4.15.5",
+    "duckdb>=1.0",
 ]
 video = ["torchcodec"]
 github = ["PyGithub>=1.60"]
