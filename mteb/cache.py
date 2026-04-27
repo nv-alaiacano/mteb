@@ -321,6 +321,65 @@ class ResultCache:
 
         return results_directory
 
+    @staticmethod
+    def _fetch_branch_file_bytes(
+        *,
+        branch: str,
+        filename: str,
+        remote: str,
+        timeout: int,
+        max_size_mb: int,
+        allowed_content_types: tuple[str, ...] = (
+            "application/gzip",
+            "application/octet-stream",
+            "application/x-gzip",
+            "application/vnd.apache.parquet",
+        ),
+    ) -> bytes:
+        """Download a single file from a branch as raw bytes, handling Git LFS pointers.
+
+        Shared transport for the gzip-JSON and parquet cache downloaders.
+        """
+        # Extract repository owner and name from the remote URL
+        # e.g., "https://github.com/embeddings-benchmark/results" -> "embeddings-benchmark/results"
+        repo_path = remote.replace("https://github.com/", "").replace(
+            "http://github.com/", ""
+        )
+
+        url = f"https://raw.githubusercontent.com/{repo_path}/{branch}/{filename}"
+        logger.info(f"Downloading cached results from {url}")
+
+        max_size_bytes = max_size_mb * 1024 * 1024
+
+        response = requests.get(url, timeout=timeout)
+        response.raise_for_status()
+
+        # Check if this is a Git LFS pointer file
+        content_type = response.headers.get("content-type", "").lower()
+        if (
+            content_type == "text/plain; charset=utf-8"
+            and b"git-lfs" in response.content
+        ):
+            media_url = f"https://media.githubusercontent.com/media/{repo_path}/{branch}/{filename}"
+            logger.info(f"Detected Git LFS file, trying media URL: {media_url}")
+            response = requests.get(media_url, timeout=timeout)
+            response.raise_for_status()
+            content_type = response.headers.get("content-type", "").lower()
+
+        if content_type and not any(ct in content_type for ct in allowed_content_types):
+            raise ValueError(
+                f"Unexpected content-type: {content_type}. Expected one of: {list(allowed_content_types)}"
+            )
+
+        content_length = len(response.content)
+        if content_length > max_size_bytes:
+            raise ValueError(
+                f"Downloaded file too large: {content_length} bytes (max: {max_size_bytes})"
+            )
+
+        logger.info(f"HTTP request successful, content length: {content_length} bytes")
+        return response.content
+
     def _download_cached_results_from_branch(
         self,
         *,
@@ -375,86 +434,82 @@ class ResultCache:
             # Default to saving in {cache_path}/leaderboard/__cached_results.json
             output_path = self.cache_path / "leaderboard" / "__cached_results.json"
 
-        # Extract repository owner and name from the remote URL
-        # e.g., "https://github.com/embeddings-benchmark/results" -> "embeddings-benchmark/results"
-        repo_path = remote.replace("https://github.com/", "").replace(
-            "http://github.com/", ""
+        content = self._fetch_branch_file_bytes(
+            branch=branch,
+            filename=filename,
+            remote=remote,
+            timeout=timeout,
+            max_size_mb=max_size_mb,
         )
 
-        url = f"https://raw.githubusercontent.com/{repo_path}/{branch}/{filename}"
-        logger.info(f"Downloading cached results from {url}")
-
-        # Step 1: Download with validation
-        max_size_bytes = max_size_mb * 1024 * 1024
-
-        try:
-            response = requests.get(url, timeout=timeout)
-            response.raise_for_status()
-
-            # Check if this is a Git LFS pointer file
-            content_type = response.headers.get("content-type", "").lower()
-            if (
-                content_type == "text/plain; charset=utf-8"
-                and b"git-lfs" in response.content
-            ):
-                # Try Git LFS media URL instead
-                media_url = f"https://media.githubusercontent.com/media/{repo_path}/{branch}/{filename}"
-                logger.info(f"Detected Git LFS file, trying media URL: {media_url}")
-                response = requests.get(media_url, timeout=timeout)
-                response.raise_for_status()
-                content_type = response.headers.get("content-type", "").lower()
-
-            # Validate content-type header
-            expected_content_types = [
-                "application/gzip",
-                "application/octet-stream",
-                "application/x-gzip",
-            ]
-            if content_type and not any(
-                ct in content_type for ct in expected_content_types
-            ):
-                raise Exception(
-                    f"Unexpected content-type: {content_type}. Expected one of: {expected_content_types}"
-                )
-
-            # Validate file size
-            content_length = len(response.content)
-            if content_length > max_size_bytes:
-                raise ValueError(
-                    f"Downloaded file too large: {content_length} bytes (max: {max_size_bytes})"
-                )
-
-            logger.info(
-                f"HTTP request successful, content length: {content_length} bytes"
-            )
-            content = response.content
-
-        except Exception as e:
-            logger.error(f"Unexpected HTTP error: {type(e).__name__}: {e}")
-            raise e
-
-        # Step 2: Decompress gzip data
         logger.info("Attempting gzip decompression...")
-
         try:
             with gzip.open(io.BytesIO(content), "rt", encoding="utf-8") as gz_file:
                 data = gz_file.read()
             logger.info(f"Decompression successful, data length: {len(data)} chars")
-
         except Exception as e:
             logger.error(f"Unexpected decompression error: {type(e).__name__}: {e}")
             raise e
 
-        # Step 3: Write to disk
         logger.info(f"Attempting to write to: {output_path}")
-
-        # Check parent directory exists and is writable
         output_path.parent.mkdir(parents=True, exist_ok=True)
 
         try:
             output_path.write_text(data, encoding="utf-8")
             logger.info(
                 f"File write successful, size: {output_path.stat().st_size} bytes"
+            )
+        except Exception as e:
+            logger.error(f"Unexpected file write error: {type(e).__name__}: {e}")
+            raise e
+
+        return output_path
+
+    def _download_cached_parquet_from_branch(
+        self,
+        *,
+        branch: str = "cached-data",
+        filename: str = "__cached_results.parquet",
+        output_path: Path | None = None,
+        remote: str = "https://github.com/embeddings-benchmark/results",
+        timeout: int = 60,
+        max_size_mb: int = 500,
+    ) -> Path:
+        """Download a pre-computed parquet cache from a specific branch.
+
+        Mirrors :meth:`_download_cached_results_from_branch` but skips
+        decompression and writes the raw bytes directly to disk, since
+        parquet is already a compressed binary format.
+
+        Args:
+            branch: Branch name to download from (default: ``"cached-data"``).
+            filename: Name of the parquet file (default: ``"__cached_results.parquet"``).
+            output_path: Where to save the file. If ``None``, uses
+                ``{cache_path}/leaderboard/__cached_results.parquet``.
+            remote: Base URL of the results repository.
+            timeout: Request timeout in seconds.
+            max_size_mb: Maximum allowed file size in megabytes.
+
+        Returns:
+            Path to the downloaded parquet file.
+        """
+        if output_path is None:
+            output_path = self.cache_path / "leaderboard" / "__cached_results.parquet"
+
+        content = self._fetch_branch_file_bytes(
+            branch=branch,
+            filename=filename,
+            remote=remote,
+            timeout=timeout,
+            max_size_mb=max_size_mb,
+        )
+
+        logger.info(f"Writing parquet cache to {output_path}")
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        try:
+            output_path.write_bytes(content)
+            logger.info(
+                f"Parquet write successful, size: {output_path.stat().st_size} bytes"
             )
         except Exception as e:
             logger.error(f"Unexpected file write error: {type(e).__name__}: {e}")
@@ -476,77 +531,132 @@ class ResultCache:
         self,
         cache_filename: str = "__cached_results.json",
         rebuild: bool = False,
+        parquet_cache_filename: str = "__cached_results.parquet",
     ) -> BenchmarkResults:
         """Load benchmark results using the best available strategy.
 
         Args:
-            cache_filename: Name of the cache file. The full path will be constructed as
-                {cache_path}/leaderboard/{cache_filename}.
-            rebuild: If True, force a full rebuild from the results repository, bypassing any
-                     pre-computed JSON cache.
+            cache_filename: Name of the JSON cache file. Used both for local
+                hits and for the rebuild output path. The full path is
+                ``{cache_path}/leaderboard/{cache_filename}``.
+            rebuild: If True, force a full rebuild from the results
+                repository, bypassing any pre-computed cache.
+            parquet_cache_filename: Name of the parquet cache file. Used for
+                the parquet-preferring lookups in the ladder below.
 
-        Strategy:
-            1. If rebuild=False and local cache exists at cache_path → load and return
-            2. If rebuild=False, try downloading pre-computed cache from 'cached-data' branch
-               → save to cache_path and return
-            3. Fallback (or if rebuild=True): clone the full results repository, build from
-               individual model files, call results.to_disk(cache_path), and return.
+        Strategy (in order; first success wins):
+            1. Local parquet cache hit → ``BenchmarkResults.from_parquet``.
+            2. Local JSON cache hit → ``BenchmarkResults.from_disk``
+               (back-compat with caches written by older mteb versions).
+            3. Download parquet from the ``cached-data`` branch →
+               ``from_parquet``.
+            4. Download gzipped JSON from the ``cached-data`` branch →
+               ``from_disk``.
+            5. Clone/refresh the full results repository, rebuild the
+               ``BenchmarkResults`` object from individual ``*.json``
+               files, and persist it to both parquet and JSON for
+               future runs.
+
+        Steps 1, 2 and 3 are skipped if ``rebuild=True``. Step 4 is also
+        skipped on rebuild (the rebuild path always re-derives the full
+        object tree from per-task files).
 
         Returns:
-            BenchmarkResults ready for leaderboard display
+            BenchmarkResults ready for leaderboard display.
         """
-        cache_path = self.cache_path / "leaderboard" / cache_filename
+        leaderboard_dir = self.cache_path / "leaderboard"
+        json_cache_path = leaderboard_dir / cache_filename
+        parquet_cache_path = leaderboard_dir / parquet_cache_filename
 
-        # If rebuild=True, skip directly to full repository rebuild
         if rebuild:
             logger.info(
                 "Rebuild requested, forcing full repository clone and rebuild..."
             )
-            return self._rebuild_from_full_repository(cache_path)
+            return self._rebuild_from_full_repository(
+                json_cache_path,
+                parquet_cache_path=parquet_cache_path,
+            )
 
-        # Strategy 1: Try loading from existing local quick cache
-        if cache_path.exists():
-            logger.info(f"Loading existing quick cache from {cache_path}")
+        # Strategy 1: local parquet hit
+        if parquet_cache_path.exists():
+            logger.info(f"Loading existing parquet cache from {parquet_cache_path}")
             try:
-                return BenchmarkResults.from_disk(cache_path)
+                return BenchmarkResults.from_parquet(parquet_cache_path)
             except Exception as e:
                 logger.warning(
-                    f"Failed to load quick cache: {e}. Trying other strategies..."
+                    f"Failed to load parquet cache: {e}. Trying other strategies..."
                 )
 
-        # Strategy 2: Try downloading from cached-data branch
+        # Strategy 2: local JSON hit (back-compat with older caches)
+        if json_cache_path.exists():
+            logger.info(f"Loading existing JSON cache from {json_cache_path}")
+            try:
+                return BenchmarkResults.from_disk(json_cache_path)
+            except Exception as e:
+                logger.warning(
+                    f"Failed to load JSON cache: {e}. Trying other strategies..."
+                )
+
+        # Strategy 3: parquet from cached-data branch
         try:
             logger.info(
-                "Attempting to download pre-computed cache from cached-data branch..."
+                "Attempting to download pre-computed parquet cache from cached-data branch..."
+            )
+            downloaded_path = self._download_cached_parquet_from_branch(
+                output_path=parquet_cache_path
+            )
+            logger.info(f"Downloaded parquet cache to {downloaded_path}")
+            return BenchmarkResults.from_parquet(downloaded_path)
+        except Exception as e:
+            logger.warning(
+                f"Failed to download/parse parquet from cached-data branch: {e}"
+            )
+
+        # Strategy 4: gzipped JSON from cached-data branch
+        try:
+            logger.info(
+                "Attempting to download pre-computed JSON cache from cached-data branch..."
             )
             downloaded_path = self._download_cached_results_from_branch(
-                output_path=cache_path
+                output_path=json_cache_path
             )
-            logger.info(f"Downloaded cache to {downloaded_path}")
+            logger.info(f"Downloaded JSON cache to {downloaded_path}")
             return BenchmarkResults.from_disk(downloaded_path)
         except Exception as e:
             logger.warning(f"Failed to download from cached-data branch: {e}")
 
-        # Strategy 3: Fallback to full repository clone
+        # Strategy 5: full repo rebuild
         logger.info("Falling back to full repository clone and rebuild...")
-        return self._rebuild_from_full_repository(cache_path)
+        return self._rebuild_from_full_repository(
+            json_cache_path,
+            parquet_cache_path=parquet_cache_path,
+        )
 
-    def _rebuild_from_full_repository(self, quick_cache_path: Path) -> BenchmarkResults:
+    def _rebuild_from_full_repository(
+        self,
+        quick_cache_path: Path,
+        *,
+        parquet_cache_path: Path | None = None,
+    ) -> BenchmarkResults:
         """Clone/pull the full results repository and build BenchmarkResults from individual files.
 
         This method performs a full rebuild by:
-        1. Downloading or updating the full results repository
-        2. Loading results from all individual model files
-        3. Saving the aggregated results to the quick cache path
-        4. Returning the BenchmarkResults object
+        1. Downloading or updating the full results repository.
+        2. Loading results from all individual model files.
+        3. Saving the aggregated results to the JSON quick cache path
+           (always) and to the parquet cache path (when supplied and
+           pyarrow is importable).
+        4. Returning the BenchmarkResults object.
 
         Args:
-            quick_cache_path: Path where the rebuilt cache should be saved
+            quick_cache_path: Path where the rebuilt JSON cache should be saved.
+            parquet_cache_path: Optional path where a parquet copy of the
+                rebuilt cache should also be written. Failures to write
+                parquet are logged but do not abort the rebuild.
 
         Returns:
-            BenchmarkResults built from the full repository
+            BenchmarkResults built from the full repository.
         """
-        # Download or update the full repository
         self.download_from_remote()
 
         all_model_names = [
@@ -562,9 +672,18 @@ class ResultCache:
             include_remote=True,
         )
 
-        # Save to disk for future use
-        logger.info(f"Saving rebuilt cache to {quick_cache_path}")
+        logger.info(f"Saving rebuilt JSON cache to {quick_cache_path}")
         all_results.to_disk(quick_cache_path)
+
+        if parquet_cache_path is not None:
+            try:
+                logger.info(f"Saving rebuilt parquet cache to {parquet_cache_path}")
+                all_results.to_parquet(parquet_cache_path)
+            except Exception as e:
+                logger.warning(
+                    f"Failed to write parquet cache to {parquet_cache_path}: {e}. "
+                    "JSON cache was still written successfully."
+                )
 
         return all_results
 

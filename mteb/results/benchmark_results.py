@@ -5,7 +5,7 @@ import json
 import logging
 import warnings
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Literal, cast
+from typing import TYPE_CHECKING, Any, ClassVar, Literal, cast
 
 import pandas as pd
 from packaging.version import InvalidVersion, Version
@@ -550,6 +550,216 @@ class BenchmarkResults(BaseModel):  # noqa: PLR0904
         with path.open() as in_file:
             data = json.loads(in_file.read())
         return cls.from_dict(data)
+
+    # ------------------------------------------------------------------
+    # Parquet I/O
+    # ------------------------------------------------------------------
+    # The parquet file uses a flat one-row-per-(model x task x split x subset)
+    # layout. It is intended primarily for the leaderboard cache, where each
+    # score dict only contains main_score / hf_subset / languages
+    # (i.e. only_main_score=True). Extra metric-specific fields on score
+    # dicts are NOT preserved by to_parquet -> from_parquet round-trips.
+    _PARQUET_COLUMNS: ClassVar[tuple[str, ...]] = (
+        "model_name",
+        "model_revision",
+        "experiment_name",
+        "task_name",
+        "dataset_revision",
+        "mteb_version",
+        "evaluation_time",
+        "kg_co2_emissions",
+        "date",
+        "split",
+        "hf_subset",
+        "languages",
+        "main_score",
+    )
+
+    @staticmethod
+    def _parquet_schema() -> Any:
+        """Return the pyarrow schema used by to_parquet / from_parquet."""
+        import pyarrow as pa
+
+        return pa.schema(
+            [
+                ("model_name", pa.string()),
+                ("model_revision", pa.string()),
+                ("experiment_name", pa.string()),
+                ("task_name", pa.string()),
+                ("dataset_revision", pa.string()),
+                ("mteb_version", pa.string()),
+                ("evaluation_time", pa.float64()),
+                ("kg_co2_emissions", pa.float64()),
+                ("date", pa.timestamp("us", tz="UTC")),
+                ("split", pa.string()),
+                ("hf_subset", pa.string()),
+                ("languages", pa.list_(pa.string())),
+                ("main_score", pa.float64()),
+            ]
+        )
+
+    def to_parquet(
+        self,
+        path: Path | str,
+        *,
+        compression: str = "zstd",
+        compression_level: int = 3,
+    ) -> None:
+        """Save the BenchmarkResults to a Parquet file.
+
+        Uses a flat one-row-per-(model x task x split x subset) layout.
+        Only the main_score / hf_subset / languages fields of each score
+        dict are preserved; extra metric-specific fields are dropped.
+
+        Args:
+            path: Path to write to.
+            compression: Parquet compression codec. "zstd" by default.
+            compression_level: Compression level passed through to pyarrow.
+        """
+        import pyarrow as pa
+        import pyarrow.parquet as pq
+
+        path = Path(path)
+        cols: dict[str, list] = {name: [] for name in self._PARQUET_COLUMNS}
+
+        for model_result in self.model_results:
+            model_name = model_result.model_name
+            model_revision = model_result.model_revision
+            experiment_name = getattr(model_result, "experiment_name", None)
+            for task_result in model_result.task_results:
+                task_name = task_result.task_name
+                dataset_revision = task_result.dataset_revision
+                mteb_version = task_result.mteb_version
+                evaluation_time = task_result.evaluation_time
+                kg_co2_emissions = task_result.kg_co2_emissions
+                date = task_result.date
+                for split, score_list in task_result.scores.items():
+                    for score in score_list:
+                        cols["model_name"].append(model_name)
+                        cols["model_revision"].append(model_revision)
+                        cols["experiment_name"].append(experiment_name)
+                        cols["task_name"].append(task_name)
+                        cols["dataset_revision"].append(dataset_revision)
+                        cols["mteb_version"].append(mteb_version)
+                        cols["evaluation_time"].append(evaluation_time)
+                        cols["kg_co2_emissions"].append(kg_co2_emissions)
+                        cols["date"].append(date)
+                        cols["split"].append(split)
+                        cols["hf_subset"].append(score.get("hf_subset", "default"))
+                        cols["languages"].append(list(score.get("languages", [])))
+                        cols["main_score"].append(score.get("main_score"))
+
+        table = pa.table(cols, schema=self._parquet_schema())
+        pq.write_table(
+            table,
+            path,
+            compression=compression,
+            compression_level=compression_level,
+            use_dictionary=["model_name", "task_name", "split", "hf_subset"],
+        )
+
+    @classmethod
+    def from_parquet(cls, path: Path | str) -> Self:
+        """Load BenchmarkResults from a Parquet file written by to_parquet.
+
+        Reconstructs the nested ModelResult / TaskResult tree without
+        re-running Pydantic validation (model_construct), so this is fast
+        even for the multi-million-row leaderboard cache.
+
+        Args:
+            path: Path to the parquet file.
+
+        Returns:
+            An instance of BenchmarkResults.
+        """
+        from collections import defaultdict
+
+        import pyarrow.parquet as pq
+
+        from .task_result import TaskResult
+
+        path = Path(path)
+        table = pq.read_table(path)
+
+        # Materializing each column once via to_pylist is significantly
+        # faster than per-row access on Arrow Tables for ~10M-row inputs.
+        cols = {name: table.column(name).to_pylist() for name in cls._PARQUET_COLUMNS}
+        n = table.num_rows
+
+        # nested[model_key][task_key][split] -> list of score dicts
+        nested: dict[tuple, dict[tuple, dict[str, list[dict]]]] = defaultdict(
+            lambda: defaultdict(lambda: defaultdict(list))
+        )
+
+        model_name_col = cols["model_name"]
+        model_revision_col = cols["model_revision"]
+        experiment_name_col = cols["experiment_name"]
+        task_name_col = cols["task_name"]
+        dataset_revision_col = cols["dataset_revision"]
+        mteb_version_col = cols["mteb_version"]
+        evaluation_time_col = cols["evaluation_time"]
+        kg_co2_emissions_col = cols["kg_co2_emissions"]
+        date_col = cols["date"]
+        split_col = cols["split"]
+        hf_subset_col = cols["hf_subset"]
+        languages_col = cols["languages"]
+        main_score_col = cols["main_score"]
+
+        for i in range(n):
+            model_key = (
+                model_name_col[i],
+                model_revision_col[i],
+                experiment_name_col[i],
+            )
+            task_key = (
+                task_name_col[i],
+                dataset_revision_col[i],
+                mteb_version_col[i],
+                evaluation_time_col[i],
+                kg_co2_emissions_col[i],
+                date_col[i],
+            )
+            split = split_col[i]
+            languages = languages_col[i]
+            score: dict = {
+                "main_score": main_score_col[i],
+                "hf_subset": hf_subset_col[i],
+                "languages": list(languages) if languages is not None else [],
+            }
+            nested[model_key][task_key][split].append(score)
+
+        model_results = []
+        for (model_name, model_revision, experiment_name), task_dict in nested.items():
+            task_results = []
+            for (
+                task_name,
+                dataset_revision,
+                mteb_version,
+                evaluation_time,
+                kg_co2_emissions,
+                date,
+            ), split_dict in task_dict.items():
+                task_results.append(
+                    TaskResult.model_construct(
+                        task_name=task_name,
+                        dataset_revision=dataset_revision,
+                        mteb_version=mteb_version,
+                        evaluation_time=evaluation_time,
+                        kg_co2_emissions=kg_co2_emissions,
+                        date=date,
+                        scores=dict(split_dict),
+                    )
+                )
+            model_results.append(
+                ModelResult.model_construct(
+                    model_name=model_name,
+                    model_revision=model_revision,
+                    experiment_name=experiment_name,
+                    task_results=task_results,
+                )
+            )
+
+        return cls.model_construct(model_results=model_results)
 
     @property
     def languages(self) -> list[str]:
