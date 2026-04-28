@@ -417,6 +417,16 @@ def _leaderboard(args: argparse.Namespace) -> None:
             + f"{e}"
         )
 
+    # ``main()`` configures the root logger at WARNING so general CLI commands
+    # stay quiet. The leaderboard's boot path emits per-step timing and
+    # progress at INFO (see ``get_leaderboard_app`` in
+    # ``mteb/leaderboard/app.py``); without raising the level for this
+    # subtree those messages are silently dropped, which makes debugging
+    # slow startup essentially impossible. Scoping to ``mteb.leaderboard``
+    # rather than touching the root keeps unrelated chatter (e.g. task
+    # registry warnings, model metadata fetches) suppressed.
+    logging.getLogger("mteb.leaderboard").setLevel(logging.INFO)
+
     cache_path = args.cache_path
 
     if cache_path:

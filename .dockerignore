@@ -1,0 +1,35 @@
+# Anything in here is excluded from the Docker build context. Keeping
+# the context small makes `COPY . /mteb` fast and avoids invalidating
+# the cached `uv sync` layer when unrelated files (tests, docs, IDE
+# state) change.
+
+# Local virtualenv: rebuilt inside the image by `uv sync`. Without this
+# entry the host's `.venv` (~6 GB after `--extra leaderboard`) gets
+# copied in and then immediately overwritten.
+.venv/
+
+# VCS / editor / tool caches
+.git/
+.github/
+.gitignore
+.mypy_cache/
+.pytest_cache/
+.ruff_cache/
+.vscode/
+.cache/
+
+# Python build artifacts
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+build/
+dist/
+
+# Repo-internal scratch space
+website-notes/
+
+# Heavy directories not needed at runtime
+docs/
+tests/
+scripts/

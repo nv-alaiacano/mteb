@@ -3,4 +3,10 @@ FROM ghcr.io/embeddings-benchmark/mteb/leaderboard:latest
 ENV GRADIO_SERVER_NAME="0.0.0.0"
 EXPOSE 7860
 
-CMD ["make", "run-leaderboard"]
+# Invoke python directly rather than going through `make run-leaderboard`
+# (which calls `uv run --extra leaderboard python -m mteb leaderboard`).
+# `uv run` re-validates the universal lockfile on every invocation, which
+# is multi-minute on this codebase and would happen on every Space
+# container start. The base image already has the venv on PATH, so a
+# bare `python -m mteb leaderboard` resolves to the right interpreter.
+CMD ["python", "-m", "mteb", "leaderboard"]
