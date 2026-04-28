@@ -16,6 +16,7 @@ connection use.
 
 from __future__ import annotations
 
+import threading
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
@@ -58,33 +59,47 @@ class ParquetResultsQuery:
             raise FileNotFoundError(f"parquet file not found: {self.parquet_path}")
         self._conn: duckdb.DuckDBPyConnection | None = None
         self._view = "scores"
+        # Guards lazy opening of _conn against concurrent first-callers.
+        # Once _conn is set, callers that need their own catalog state
+        # should use ``_conn.cursor()`` rather than reusing _conn itself.
+        self._init_lock = threading.Lock()
 
     # ------------------------------------------------------------------
     # Connection plumbing
     # ------------------------------------------------------------------
     def _ensure_conn(self) -> duckdb.DuckDBPyConnection:
-        """Lazily open the DuckDB connection and create the parquet view."""
+        """Lazily open the DuckDB connection and create the parquet view.
+
+        The returned connection is shared across callers and is intended
+        to be used as a *parent* for ``conn.cursor()`` calls -- DuckDB
+        connections are not thread-safe, but cursors derived from one
+        connection are independent and safe to use concurrently.
+        """
         if self._conn is not None:
             return self._conn
 
-        try:
-            import duckdb
-        except ImportError as e:
-            raise ImportError(_DUCKDB_IMPORT_ERROR) from e
+        with self._init_lock:
+            if self._conn is not None:
+                return self._conn
 
-        conn = duckdb.connect(":memory:")
-        # DuckDB does not support binding parameters inside read_parquet()
-        # within a CREATE VIEW statement, so the path is interpolated as
-        # a SQL string literal. self.parquet_path was resolved from a
-        # caller-supplied Path on construction; single quotes are escaped
-        # defensively to keep this safe even on weird filesystem paths.
-        path_literal = str(self.parquet_path).replace("'", "''")
-        conn.execute(
-            f"CREATE VIEW {self._view} AS "  # noqa: S608 -- _view is a hardcoded identifier
-            f"SELECT * FROM read_parquet('{path_literal}')"
-        )
-        self._conn = conn
-        return conn
+            try:
+                import duckdb
+            except ImportError as e:
+                raise ImportError(_DUCKDB_IMPORT_ERROR) from e
+
+            conn = duckdb.connect(":memory:")
+            # DuckDB does not support binding parameters inside read_parquet()
+            # within a CREATE VIEW statement, so the path is interpolated as
+            # a SQL string literal. self.parquet_path was resolved from a
+            # caller-supplied Path on construction; single quotes are escaped
+            # defensively to keep this safe even on weird filesystem paths.
+            path_literal = str(self.parquet_path).replace("'", "''")
+            conn.execute(
+                f"CREATE VIEW {self._view} AS "  # noqa: S608 -- _view is a hardcoded identifier
+                f"SELECT * FROM read_parquet('{path_literal}')"
+            )
+            self._conn = conn
+            return conn
 
     def close(self) -> None:
         """Release the in-memory DuckDB connection."""

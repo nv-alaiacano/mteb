@@ -288,66 +288,75 @@ class ParquetBenchmarkResults(BenchmarkResults):
         ``sql_template`` must contain a ``{from_clause}`` placeholder.
         Materializes the keep-sets as DuckDB temp tables for the duration
         of the query and joins them into the FROM clause.
+
+        Uses a fresh ``conn.cursor()`` per call. DuckDB connections are
+        not thread-safe -- two threads sharing one connection corrupt
+        each other's state and the second thread sees ``Attempting to
+        execute an unsuccessful or closed pending query result``. Gradio
+        runs callbacks on ``anyio.to_thread.run_sync``'s worker pool, so
+        boot + interaction routinely fire concurrent reads. ``cursor()``
+        returns an independent connection that shares the in-memory
+        database (and the ``scores`` view) but has its own catalog state
+        for registered views, so concurrent callbacks no longer collide.
+        Registered temp tables are scoped to the cursor and released
+        when the cursor is closed.
         """
-        conn = self._parquet_query._ensure_conn()
-        view = self._parquet_query._view
-        f = self._filter
-
-        join_sqls: list[str] = []
-
-        if f.allowed_combos is not None:
-            if not f.allowed_combos:
-                # No allowed combos -> no rows match.
-                return pd.DataFrame()
-            combos_df = pd.DataFrame(
-                list(f.allowed_combos),
-                columns=["task_name", "split", "hf_subset"],
-            )
-            conn.register("__allowed_combos", combos_df)
-            join_sqls.append(
-                "INNER JOIN __allowed_combos ac "
-                "ON scores.task_name = ac.task_name "
-                "AND scores.split = ac.split "
-                "AND scores.hf_subset = ac.hf_subset"
-            )
-
-        if f.revision_keepset is not None:
-            if not f.revision_keepset:
-                return pd.DataFrame()
-            keep_df = pd.DataFrame(
-                list(f.revision_keepset),
-                columns=[
-                    "model_name",
-                    "task_name",
-                    "model_revision",
-                    "mteb_version",
-                    "dataset_revision",
-                ],
-            )
-            conn.register("__revision_keepset", keep_df)
-            # IS NOT DISTINCT FROM is NULL-aware: a NULL on either side
-            # only matches another NULL. Without it the JOIN would drop
-            # rows whose mteb_version / dataset_revision is NULL even
-            # when the canonical row chosen by join_revisions is also
-            # NULL.
-            join_sqls.append(
-                "INNER JOIN __revision_keepset k "
-                "ON scores.model_name = k.model_name "
-                "AND scores.task_name = k.task_name "
-                "AND scores.model_revision IS NOT DISTINCT FROM k.model_revision "
-                "AND scores.mteb_version IS NOT DISTINCT FROM k.mteb_version "
-                "AND scores.dataset_revision IS NOT DISTINCT FROM k.dataset_revision"
-            )
-
-        from_clause = f"{view} AS scores " + " ".join(join_sqls)
-        sql = sql_template.format(from_clause=from_clause)
+        base_conn = self._parquet_query._ensure_conn()
+        cursor = base_conn.cursor()
         try:
-            return conn.execute(sql, params).df()
-        finally:
+            view = self._parquet_query._view
+            f = self._filter
+
+            join_sqls: list[str] = []
+
             if f.allowed_combos is not None:
-                conn.unregister("__allowed_combos")
+                if not f.allowed_combos:
+                    return pd.DataFrame()
+                combos_df = pd.DataFrame(
+                    list(f.allowed_combos),
+                    columns=["task_name", "split", "hf_subset"],
+                )
+                cursor.register("__allowed_combos", combos_df)
+                join_sqls.append(
+                    "INNER JOIN __allowed_combos ac "
+                    "ON scores.task_name = ac.task_name "
+                    "AND scores.split = ac.split "
+                    "AND scores.hf_subset = ac.hf_subset"
+                )
+
             if f.revision_keepset is not None:
-                conn.unregister("__revision_keepset")
+                if not f.revision_keepset:
+                    return pd.DataFrame()
+                keep_df = pd.DataFrame(
+                    list(f.revision_keepset),
+                    columns=[
+                        "model_name",
+                        "task_name",
+                        "model_revision",
+                        "mteb_version",
+                        "dataset_revision",
+                    ],
+                )
+                cursor.register("__revision_keepset", keep_df)
+                # IS NOT DISTINCT FROM is NULL-aware: a NULL on either
+                # side only matches another NULL. Without it the JOIN
+                # would drop rows whose mteb_version / dataset_revision
+                # is NULL even when the canonical row chosen by
+                # join_revisions is also NULL.
+                join_sqls.append(
+                    "INNER JOIN __revision_keepset k "
+                    "ON scores.model_name = k.model_name "
+                    "AND scores.task_name = k.task_name "
+                    "AND scores.model_revision IS NOT DISTINCT FROM k.model_revision "
+                    "AND scores.mteb_version IS NOT DISTINCT FROM k.mteb_version "
+                    "AND scores.dataset_revision IS NOT DISTINCT FROM k.dataset_revision"
+                )
+
+            from_clause = f"{view} AS scores " + " ".join(join_sqls)
+            sql = sql_template.format(from_clause=from_clause)
+            return cursor.execute(sql, params).df()
+        finally:
+            cursor.close()
 
     # ------------------------------------------------------------------
     # to_dataframe (Step A + Step B fused into one SQL query)
