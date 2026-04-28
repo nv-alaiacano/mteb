@@ -1262,52 +1262,29 @@ def get_leaderboard_app(  # noqa: PLR0914
     interface_time = time.time() - interface_start
     logger.info(f"Step 7/7 complete: Built Gradio interface in {interface_time:.2f}s")
 
-    logger.info("Starting prerun on all benchmarks to populate caches...")
-    prerun_start = time.time()
-    # Prerun on all benchmarks, so that results of callbacks get cached
-    for benchmark in benchmarks:
-        (
-            bench_languages,
-            bench_domains,
-            bench_types,
-            bench_modalities,
-            bench_tasks,
-            bench_scores,
-            zero_shot,
-            bench_initial_models,
-            display_radar,
-            summary_raw,
-            perf_size_plot,
-            perf_time_plot,
-            radar_chart_plot,
-        ) = on_benchmark_select(benchmark.name)
-        # Call update_tables to populate cache (simulating models.change trigger)
-        update_tables(
-            bench_scores,
-            bench_tasks,
-            bench_initial_models,
-            benchmark.name,
-            bench_languages,
-        )
-        # Also cache the filtered tasks scenario
-        filtered_tasks = update_task_list(
-            benchmark.name,
-            bench_types,
-            bench_domains,
-            bench_languages,
-            bench_modalities,
-        )
-        update_tables(
-            bench_scores,
-            filtered_tasks,
-            bench_initial_models,
-            benchmark.name,
-            bench_languages,
-        )
-    prerun_time = time.time() - prerun_start
-    logger.info(
-        f"Prerun complete: Processed {len(benchmarks)} benchmarks in {prerun_time:.2f}s"
-    )
+    # Historically this function ran a synchronous "prerun" loop that called
+    # ``on_benchmark_select`` and ``update_tables`` (twice) for every
+    # benchmark in order to populate the ``cachetools`` caches before the
+    # server started accepting traffic. That made sense in the pandas-era
+    # leaderboard, where each callback rebuilt large in-memory DataFrames
+    # and the first click on a benchmark could take many seconds.
+    #
+    # With the DuckDB-backed ``ParquetBenchmarkResults`` callbacks now
+    # resolve to a single SQL query against the cached parquet, so the
+    # warm/cold gap is small. The prerun loop on the other hand was the
+    # dominant cost on boot: ~42s of the observed 65s container startup,
+    # iterating ~55 benchmarks and triggering plot generation (and
+    # spurious ERROR logs from radar charts on single-task benchmarks)
+    # for each one. Crucially it ran *before* ``app.launch()``, so HF
+    # Spaces showed the container as unhealthy / unreachable for the
+    # duration. Removing it gets server-listening from ~65s to ~23s with
+    # a barely-perceptible cost on the first interaction per benchmark.
+    #
+    # If a future change re-introduces an expensive callback path that
+    # genuinely benefits from prewarming, prefer running it in a
+    # ``threading.Thread(daemon=True)`` started just before ``return demo``
+    # so the server can come up immediately while caches warm in the
+    # background.
 
     total_time = time.time() - app_start
     logger.info(f"=== Leaderboard app initialization complete in {total_time:.2f}s ===")
